@@ -13,11 +13,20 @@
 (define-constant ERR_LOAN_NOT_ACTIVE (err u403))
 (define-constant ERR_PAYMENT_TOO_LOW (err u402))
 (define-constant ERR_LOAN_FULLY_PAID (err u410))
+(define-constant ERR_REFINANCE_NOT_ELIGIBLE (err u411))
+(define-constant ERR_REFINANCE_REQUEST_NOT_FOUND (err u412))
+(define-constant ERR_REFINANCE_INVALID_TERMS (err u413))
+(define-constant ERR_REFINANCE_NOT_PENDING (err u414))
+(define-constant REFINANCE_MIN_PAYMENT_PCT u70)
+(define-constant REFINANCE_MIN_CREDIT_SCORE u650)
+(define-constant REFINANCE_MAX_COUNT u3)
+(define-constant REFINANCE_MIN_BLOCKS u34560)
 
 ;; Data Variables
 (define-data-var loan-id-counter uint u0)
 (define-data-var total-loans-issued uint u0)
 (define-data-var total-amount-disbursed uint u0)
+(define-data-var refinance-id-counter uint u0)
 
 ;; Data Maps
 (define-map loans 
@@ -65,6 +74,25 @@
         credit-score: uint,
         verified: bool
     }
+)
+
+(define-map refinance-requests
+    uint
+    {
+        original-loan-id: uint,
+        borrower: principal,
+        lender: principal,
+        new-interest-rate: uint,
+        new-term-months: uint,
+        new-monthly-payment: uint,
+        status: (string-ascii 20),
+        requested-at: uint
+    }
+)
+
+(define-map refinance-counter
+    uint
+    uint
 )
 
 ;; Private Functions
@@ -147,6 +175,43 @@
                 (> expected-paid (get amount-paid loan)))
         false
     )
+)
+
+(define-read-only (get-payment-progress (loan-id uint))
+    (match (map-get? loans loan-id)
+        loan (if (> (get principal-amount loan) u0)
+                 (/ (* (get amount-paid loan) u100) (get principal-amount loan))
+                 u0)
+        u0
+    )
+)
+
+(define-read-only (is-eligible-for-refinance (loan-id uint))
+    (match (map-get? loans loan-id)
+        loan (let ((payment-progress (if (> (get principal-amount loan) u0)
+                                         (/ (* (get amount-paid loan) u100) (get principal-amount loan))
+                                         u0))
+                   (months-passed (/ (- stacks-block-height (get created-at loan)) u4320))
+                   (refinance-count (default-to u0 (map-get? refinance-counter loan-id)))
+                   (user-profile (default-to {total-borrowed: u0, total-lent: u0, credit-score: u600, verified: false}
+                                            (map-get? user-profiles (get borrower loan)))))
+                (and
+                    (is-eq (get status loan) "active")
+                    (>= payment-progress REFINANCE_MIN_PAYMENT_PCT)
+                    (>= (get credit-score user-profile) REFINANCE_MIN_CREDIT_SCORE)
+                    (< refinance-count REFINANCE_MAX_COUNT)
+                    (> months-passed (/ REFINANCE_MIN_BLOCKS u4320))
+                ))
+        false
+    )
+)
+
+(define-read-only (get-refinance-request (refinance-id uint))
+    (map-get? refinance-requests refinance-id)
+)
+
+(define-read-only (count-loan-refinances (loan-id uint))
+    (default-to u0 (map-get? refinance-counter loan-id))
 )
 
 ;; Public Functions
@@ -333,6 +398,97 @@
         
         (map-set loans loan-id 
             (merge loan {status: "active"})
+        )
+        
+        (ok true)
+    )
+)
+
+(define-public (request-loan-refinance
+    (original-loan-id uint)
+    (new-interest-rate uint)
+    (new-term-months uint))
+    (let ((loan (unwrap! (map-get? loans original-loan-id) ERR_LOAN_NOT_FOUND))
+          (refinance-id (+ (var-get refinance-id-counter) u1))
+          (new-monthly-payment (calculate-interest (get-outstanding-balance original-loan-id) new-interest-rate new-term-months)))
+        
+        (asserts! (is-eq tx-sender (get borrower loan)) ERR_UNAUTHORIZED)
+        (asserts! (is-eligible-for-refinance original-loan-id) ERR_REFINANCE_NOT_ELIGIBLE)
+        (asserts! (and (>= new-interest-rate u100) (<= new-interest-rate u3000)) ERR_REFINANCE_INVALID_TERMS)
+        (asserts! (and (>= new-term-months u1) (<= new-term-months u480)) ERR_REFINANCE_INVALID_TERMS)
+        
+        (map-set refinance-requests refinance-id {
+            original-loan-id: original-loan-id,
+            borrower: tx-sender,
+            lender: (get lender loan),
+            new-interest-rate: new-interest-rate,
+            new-term-months: new-term-months,
+            new-monthly-payment: new-monthly-payment,
+            status: "pending",
+            requested-at: stacks-block-height
+        })
+        
+        (var-set refinance-id-counter refinance-id)
+        (ok refinance-id)
+    )
+)
+
+(define-public (approve-refinance (refinance-id uint))
+    (let ((refinance-req (unwrap! (map-get? refinance-requests refinance-id) ERR_REFINANCE_REQUEST_NOT_FOUND))
+          (original-loan (unwrap! (map-get? loans (get original-loan-id refinance-req)) ERR_LOAN_NOT_FOUND))
+          (new-loan-id (+ (var-get loan-id-counter) u1))
+          (outstanding-balance (get-outstanding-balance (get original-loan-id refinance-req))))
+        
+        (asserts! (is-eq tx-sender (get lender original-loan)) ERR_UNAUTHORIZED)
+        (asserts! (is-eq (get status refinance-req) "pending") ERR_REFINANCE_NOT_PENDING)
+        
+        (map-set refinance-requests refinance-id
+            (merge refinance-req {status: "approved"})
+        )
+        
+        (map-set loans (get original-loan-id refinance-req)
+            (merge original-loan {status: "refinanced"})
+        )
+        
+        (map-set loans new-loan-id {
+            borrower: (get borrower refinance-req),
+            lender: (get lender refinance-req),
+            principal-amount: outstanding-balance,
+            interest-rate: (get new-interest-rate refinance-req),
+            term-months: (get new-term-months refinance-req),
+            monthly-payment: (get new-monthly-payment refinance-req),
+            amount-paid: u0,
+            created-at: stacks-block-height,
+            status: "active",
+            last-payment: u0
+        })
+        
+        (let ((borrower-loan-list (default-to (list) (map-get? borrower-loans (get borrower refinance-req))))
+              (lender-loan-list (default-to (list) (map-get? lender-loans tx-sender)))
+              (refinance-count (default-to u0 (map-get? refinance-counter (get original-loan-id refinance-req)))))
+            
+            (map-set borrower-loans (get borrower refinance-req)
+                (unwrap! (as-max-len? (append borrower-loan-list new-loan-id) u50) ERR_INVALID_AMOUNT))
+            
+            (map-set lender-loans tx-sender
+                (unwrap! (as-max-len? (append lender-loan-list new-loan-id) u100) ERR_INVALID_AMOUNT))
+            
+            (map-set refinance-counter (get original-loan-id refinance-req) (+ refinance-count u1))
+        )
+        
+        (var-set loan-id-counter new-loan-id)
+        (ok new-loan-id)
+    )
+)
+
+(define-public (reject-refinance (refinance-id uint))
+    (let ((refinance-req (unwrap! (map-get? refinance-requests refinance-id) ERR_REFINANCE_REQUEST_NOT_FOUND)))
+        
+        (asserts! (is-eq tx-sender (get lender refinance-req)) ERR_UNAUTHORIZED)
+        (asserts! (is-eq (get status refinance-req) "pending") ERR_REFINANCE_NOT_PENDING)
+        
+        (map-set refinance-requests refinance-id
+            (merge refinance-req {status: "rejected"})
         )
         
         (ok true)
