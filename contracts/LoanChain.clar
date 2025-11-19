@@ -17,16 +17,26 @@
 (define-constant ERR_REFINANCE_REQUEST_NOT_FOUND (err u412))
 (define-constant ERR_REFINANCE_INVALID_TERMS (err u413))
 (define-constant ERR_REFINANCE_NOT_PENDING (err u414))
+(define-constant ERR_INSURANCE_NOT_SUBSCRIBED (err u421))
+(define-constant ERR_INSURANCE_ALREADY_SUBSCRIBED (err u420))
+(define-constant ERR_INSURANCE_POOL_INSUFFICIENT (err u425))
+(define-constant ERR_INSURANCE_CLAIM_INVALID (err u426))
 (define-constant REFINANCE_MIN_PAYMENT_PCT u70)
 (define-constant REFINANCE_MIN_CREDIT_SCORE u650)
 (define-constant REFINANCE_MAX_COUNT u3)
 (define-constant REFINANCE_MIN_BLOCKS u34560)
+(define-constant INSURANCE_PREMIUM_RATE u25)
+(define-constant INSURANCE_POOL_MIN_CONTRIBUTION u100)
+(define-constant INSURANCE_PREMIUM_CREDIT_SCORE u700)
 
 ;; Data Variables
 (define-data-var loan-id-counter uint u0)
 (define-data-var total-loans-issued uint u0)
 (define-data-var total-amount-disbursed uint u0)
 (define-data-var refinance-id-counter uint u0)
+(define-data-var insurance-pool-balance uint u0)
+(define-data-var total-insurance-claims-paid uint u0)
+(define-data-var insurance-claim-id-counter uint u0)
 
 ;; Data Maps
 (define-map loans 
@@ -95,7 +105,46 @@
     uint
 )
 
+(define-map insurance-subscriptions
+    {loan-id: uint, lender: principal}
+    {
+        subscribed: bool,
+        premium-paid: uint,
+        timestamp: uint
+    }
+)
+
+(define-map insurance-claims
+    uint
+    {
+        loan-id: uint,
+        claimant: principal,
+        claim-amount: uint,
+        status: (string-ascii 20),
+        timestamp: uint
+    }
+)
+
+(define-map pool-contributions
+    principal
+    uint
+)
+
 ;; Private Functions
+(define-private (calculate-insurance-premium (loan-amount uint) (credit-score uint))
+    (let ((base (/ (* loan-amount INSURANCE_PREMIUM_RATE) u10000))
+          (multiplier (if (>= credit-score INSURANCE_PREMIUM_CREDIT_SCORE) u90 u110)))
+        (/ (* base multiplier) u100)
+    )
+)
+
+(define-private (validate-insurance-eligibility (loan-id uint))
+    (match (map-get? loans loan-id)
+        loan (and (is-eq (get status loan) "active") (> (get principal-amount loan) u0))
+        false
+    )
+)
+
 (define-private (calculate-interest (principal uint) (rate uint) (months uint))
     (let ((monthly-rate (/ rate u1200)))
         (/ (* (* principal monthly-rate) (pow (+ u1 monthly-rate) months))
@@ -214,7 +263,101 @@
     (default-to u0 (map-get? refinance-counter loan-id))
 )
 
+(define-read-only (get-insurance-pool-balance)
+    (var-get insurance-pool-balance)
+)
+
+(define-read-only (get-insurance-status (loan-id uint))
+    (match (map-get? loans loan-id)
+        loan (default-to {subscribed: false, premium-paid: u0, timestamp: u0}
+              (map-get? insurance-subscriptions {loan-id: loan-id, lender: (get lender loan)}))
+        {subscribed: false, premium-paid: u0, timestamp: u0}
+    )
+)
+
+(define-read-only (get-insurance-premium-quote (loan-id uint))
+    (match (map-get? loans loan-id)
+        loan (let ((profile (default-to {total-borrowed: u0, total-lent: u0, credit-score: u600, verified: false}
+                                        (map-get? user-profiles (get borrower loan))))
+                   (score (get credit-score profile)))
+                (calculate-insurance-premium (get-outstanding-balance loan-id) score))
+        u0
+    )
+)
+
+(define-read-only (get-pool-utilization)
+    {
+        balance: (var-get insurance-pool-balance),
+        claims-paid: (var-get total-insurance-claims-paid)
+    }
+)
+
 ;; Public Functions
+(define-public (contribute-to-insurance-pool (amount uint))
+    (begin
+        (asserts! (> amount u0) ERR_INVALID_AMOUNT)
+        (var-set insurance-pool-balance (+ (var-get insurance-pool-balance) amount))
+        (let ((prev (default-to u0 (map-get? pool-contributions tx-sender))))
+            (map-set pool-contributions tx-sender (+ prev amount))
+        )
+        (ok true)
+    )
+)
+
+(define-public (subscribe-insurance (loan-id uint))
+    (let ((loan (unwrap! (map-get? loans loan-id) ERR_LOAN_NOT_FOUND)))
+        (asserts! (is-eq tx-sender (get lender loan)) ERR_UNAUTHORIZED)
+        (asserts! (validate-insurance-eligibility loan-id) ERR_INSURANCE_CLAIM_INVALID)
+        (let ((profile (default-to {total-borrowed: u0, total-lent: u0, credit-score: u600, verified: false}
+                                   (map-get? user-profiles (get borrower loan))))
+              (existing (map-get? insurance-subscriptions {loan-id: loan-id, lender: tx-sender})))
+            (asserts! (is-none existing) ERR_INSURANCE_ALREADY_SUBSCRIBED)
+            (let ((premium (calculate-insurance-premium (get-outstanding-balance loan-id) (get credit-score profile)))
+                  (contrib (default-to u0 (map-get? pool-contributions tx-sender))))
+                (asserts! (>= contrib premium) ERR_INSURANCE_POOL_INSUFFICIENT)
+                (map-set pool-contributions tx-sender (- contrib premium))
+                (var-set insurance-pool-balance (+ (var-get insurance-pool-balance) premium))
+                (map-set insurance-subscriptions {loan-id: loan-id, lender: tx-sender}
+                    {subscribed: true, premium-paid: premium, timestamp: stacks-block-height}
+                )
+                (ok true)
+            )
+        )
+    )
+)
+
+(define-public (claim-insurance (loan-id uint) (claim-amount uint))
+    (let ((loan (unwrap! (map-get? loans loan-id) ERR_LOAN_NOT_FOUND)))
+        (asserts! (is-eq tx-sender (get lender loan)) ERR_UNAUTHORIZED)
+        (asserts! (> claim-amount u0) ERR_INVALID_AMOUNT)
+        (let ((sub (unwrap! (map-get? insurance-subscriptions {loan-id: loan-id, lender: tx-sender}) ERR_INSURANCE_NOT_SUBSCRIBED)))
+            (asserts! (get subscribed sub) ERR_INSURANCE_NOT_SUBSCRIBED)
+            (asserts! (is-loan-overdue loan-id) ERR_INSURANCE_CLAIM_INVALID)
+            (let ((outstanding (get-outstanding-balance loan-id))
+                  (pool (var-get insurance-pool-balance))
+                  (cid (+ (var-get insurance-claim-id-counter) u1))
+                  (payable (if (< claim-amount outstanding) claim-amount (if (< outstanding pool) outstanding pool))))
+                (asserts! (> payable u0) ERR_INSURANCE_POOL_INSUFFICIENT)
+                (var-set insurance-claim-id-counter cid)
+                (var-set insurance-pool-balance (- pool payable))
+                (var-set total-insurance-claims-paid (+ (var-get total-insurance-claims-paid) payable))
+                (map-set insurance-claims cid {loan-id: loan-id, claimant: tx-sender, claim-amount: payable, status: "paid", timestamp: stacks-block-height})
+                (ok {claim-id: cid, paid: payable})
+            )
+        )
+    )
+)
+
+(define-public (withdraw-insurance-pool (amount uint))
+    (begin
+        (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+        (asserts! (> amount u0) ERR_INVALID_AMOUNT)
+        (asserts! (>= (var-get insurance-pool-balance) amount) ERR_INSURANCE_POOL_INSUFFICIENT)
+        (var-set insurance-pool-balance (- (var-get insurance-pool-balance) amount))
+        (ok true)
+    )
+)
+
 (define-public (create-loan-application 
     (lender principal)
     (principal-amount uint)
